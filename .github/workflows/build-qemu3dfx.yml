@@ -1,0 +1,255 @@
+# Compila QEMU-3dfx (QEMU + patch, OpenGlide, wrapper del guest) per
+# Windows, Linux e macOS e pubblica una release "qemu3dfx-<data>" con
+# manifest.json. L'app scarica da qui quando QEMU-3dfx non e' installato.
+#
+# Avvio: scheda Actions > "Build QEMU-3dfx" > Run workflow.
+name: Build QEMU-3dfx
+
+on:
+  workflow_dispatch:
+    inputs:
+      qemu_version:
+        description: "Versione di QEMU (deve esistere la patch qemu-3dfx per major.minor)"
+        default: "9.2.2"
+      qemu3dfx_ref:
+        description: "Branch, tag o commit di kjliew/qemu-3dfx"
+        default: "master"
+      qemu_xtra_ref:
+        description: "Branch, tag o commit di kjliew/qemu-xtra (OpenGlide)"
+        default: "master"
+
+permissions:
+  contents: write
+
+env:
+  QEMU_VERSION: ${{ inputs.qemu_version }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      xtra_sha: ${{ steps.r.outputs.xtra_sha }}
+      tag: ${{ steps.r.outputs.tag }}
+    steps:
+      - id: r
+        name: Fissa i commit sorgente
+        # Tutti i job usano lo stesso commit: QEMU e wrapper del guest
+        # devono avere la stessa "firma" (scripts/sign_commit).
+        run: |
+          resolve() {
+            local repo=$1 ref=$2 sha
+            sha=$(git ls-remote "https://github.com/$repo" "$ref" "refs/heads/$ref" "refs/tags/$ref" | head -n1 | cut -f1)
+            [ -n "$sha" ] || sha=$ref   # gia' un commit
+            echo "$sha"
+          }
+          echo "sha=$(resolve kjliew/qemu-3dfx '${{ inputs.qemu3dfx_ref }}')" >> "$GITHUB_OUTPUT"
+          echo "xtra_sha=$(resolve kjliew/qemu-xtra '${{ inputs.qemu_xtra_ref }}')" >> "$GITHUB_OUTPUT"
+          echo "tag=qemu3dfx-$(date -u +%Y.%m.%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+  wrappers:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain mingw32
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential mingw-w64 mingw-w64-tools xxd rsync perl
+      - name: Toolchain facoltative (Open Watcom, DJGPP)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          mkdir -p /opt/watcom /opt/djgpp
+          if gh release download Current-build --repo open-watcom/open-watcom-v2 \
+               --pattern 'ow-snapshot.tar.xz' --dir /tmp; then
+            tar xf /tmp/ow-snapshot.tar.xz -C /opt/watcom
+            echo "WATCOM=/opt/watcom" >> "$GITHUB_ENV"
+            echo "INCLUDE=/opt/watcom/h" >> "$GITHUB_ENV"
+            echo "/opt/watcom/binl64" >> "$GITHUB_PATH"
+            echo "/opt/watcom/binl" >> "$GITHUB_PATH"
+          fi
+          if gh release download --repo andrewwutw/build-djgpp \
+               --pattern 'djgpp-linux64-gcc*.tar.bz2' --dir /tmp; then
+            tar xf /tmp/djgpp-linux64-gcc*.tar.bz2 -C /opt/djgpp --strip-components=1
+            echo "/opt/djgpp/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Sorgenti qemu-3dfx
+        run: |
+          git clone https://github.com/kjliew/qemu-3dfx.git src
+          git -C src checkout ${{ needs.prepare.outputs.sha }}
+      - name: Compila i wrapper
+        run: bash ci/build_wrappers.sh src out/wrappers
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-wrappers
+          path: out/wrappers
+
+  qemu-linux:
+    needs: [prepare, wrappers]
+    # 22.04: glibc meno recente = binari compatibili con piu' distribuzioni.
+    runs-on: ubuntu-22.04
+    env:
+      QEMU3DFX_SHA: ${{ needs.prepare.outputs.sha }}
+      XTRA_SHA: ${{ needs.prepare.outputs.xtra_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dipendenze
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config python3-venv \
+            python3-tomli rsync libglib2.0-dev libpixman-1-dev libsdl2-dev \
+            libepoxy-dev libgbm-dev libslirp-dev libpulse-dev libasound2-dev \
+            autoconf automake libtool libsdl1.2-dev libgl-dev libglu1-mesa-dev
+      - name: Sorgenti
+        run: |
+          git clone https://github.com/kjliew/qemu-3dfx.git src
+          git -C src checkout "$QEMU3DFX_SHA"
+          git clone https://github.com/kjliew/qemu-xtra.git xtra
+          git -C xtra checkout "$XTRA_SHA"
+      - run: bash ci/build_qemu.sh src "$QEMU_VERSION" "$PWD/prefix/qemu"
+      - run: bash ci/build_openglide.sh xtra "$PWD/prefix/glide"
+      - uses: actions/download-artifact@v4
+        with: { name: guest-wrappers, path: wrappers }
+      - name: Pacchetto
+        run: |
+          bash ci/bundle.sh linux-x64 prefix/qemu prefix/glide wrappers \
+            "src/qemu-$QEMU_VERSION" out
+          tar -C out -czf qemu3dfx-linux-x64.tar.gz qemu3dfx
+      - uses: actions/upload-artifact@v4
+        with: { name: pkg-linux-x64, path: qemu3dfx-linux-x64.tar.gz }
+
+  qemu-macos:
+    needs: [prepare, wrappers]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel   # Mac Intel (macos-13 e' stato ritirato)
+            platform: macos-x64
+          - runner: macos-15         # Apple Silicon
+            platform: macos-arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      QEMU3DFX_SHA: ${{ needs.prepare.outputs.sha }}
+      XTRA_SHA: ${{ needs.prepare.outputs.xtra_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dipendenze
+        run: |
+          brew install meson ninja pkgconf glib pixman sdl2 libepoxy libslirp \
+            sdl12-compat autoconf automake libtool dylibbundler rsync binutils
+          # 'strings' di binutils serve al controllo finale in build_qemu.sh
+          echo "$(brew --prefix binutils)/bin" >> "$GITHUB_PATH"
+      - name: Sorgenti
+        run: |
+          git clone https://github.com/kjliew/qemu-3dfx.git src
+          git -C src checkout "$QEMU3DFX_SHA"
+          git clone https://github.com/kjliew/qemu-xtra.git xtra
+          git -C xtra checkout "$XTRA_SHA"
+      - run: bash ci/build_qemu.sh src "$QEMU_VERSION" "$PWD/prefix/qemu"
+      - run: bash ci/build_openglide.sh xtra "$PWD/prefix/glide"
+      - uses: actions/download-artifact@v4
+        with: { name: guest-wrappers, path: wrappers }
+      - name: Pacchetto
+        run: |
+          bash ci/bundle.sh ${{ matrix.platform }} prefix/qemu prefix/glide wrappers \
+            "src/qemu-$QEMU_VERSION" out
+          tar -C out -czf qemu3dfx-${{ matrix.platform }}.tar.gz qemu3dfx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.platform }}
+          path: qemu3dfx-${{ matrix.platform }}.tar.gz
+
+  qemu-windows:
+    needs: [prepare, wrappers]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      QEMU3DFX_SHA: ${{ needs.prepare.outputs.sha }}
+      XTRA_SHA: ${{ needs.prepare.outputs.xtra_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel git rsync patch binutils
+            autoconf automake libtool
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-libepoxy
+            mingw-w64-ucrt-x86_64-libslirp
+            mingw-w64-ucrt-x86_64-zstd
+      - name: SDL 1.2 per OpenGlide (facoltativa)
+        continue-on-error: true
+        run: pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-sdl12-compat || pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-SDL
+      - name: Sorgenti
+        run: |
+          git config --global core.autocrlf false
+          git clone https://github.com/kjliew/qemu-3dfx.git src
+          git -C src checkout "$QEMU3DFX_SHA"
+          git clone https://github.com/kjliew/qemu-xtra.git xtra
+          git -C xtra checkout "$XTRA_SHA"
+      - run: bash ci/build_qemu.sh src "$QEMU_VERSION" "$PWD/prefix/qemu"
+      - run: bash ci/build_openglide.sh xtra "$PWD/prefix/glide"
+      - uses: actions/download-artifact@v4
+        with: { name: guest-wrappers, path: wrappers }
+      - name: Pacchetto
+        run: |
+          bash ci/bundle.sh windows-x64 prefix/qemu prefix/glide wrappers \
+            "src/qemu-$QEMU_VERSION" out
+      # Lo zip si crea nel job di release: su Windows non servono permessi Unix.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows-x64
+          path: out
+
+  release:
+    needs: [prepare, qemu-linux, qemu-macos, qemu-windows]
+    # Pubblica anche se una piattaforma fallisce, purche' almeno una sia pronta.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: pkg-*, path: artifacts }
+      - name: Archivi e manifest
+        run: |
+          mkdir dist
+          find artifacts -name 'qemu3dfx-*.tar.gz' -exec cp {} dist/ \;
+          if [ -d artifacts/pkg-windows-x64/qemu3dfx ]; then
+            (cd artifacts/pkg-windows-x64 && zip -qr ../../dist/qemu3dfx-windows-x64.zip qemu3dfx)
+          fi
+          ls -la dist
+          python3 ci/make_manifest.py dist "$QEMU_VERSION" \
+            "${{ needs.prepare.outputs.sha }}" "${{ needs.prepare.outputs.xtra_sha }}"
+      - name: Pubblica la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cat > notes.md <<EOF
+          QEMU ${QEMU_VERSION} con patch qemu-3dfx, compilato da GitHub Actions.
+
+          Sorgenti (GPL-2.0 / LGPL-2.1):
+          - QEMU: https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz
+          - qemu-3dfx: https://github.com/kjliew/qemu-3dfx/tree/${{ needs.prepare.outputs.sha }}
+          - OpenGlide: https://github.com/kjliew/qemu-xtra/tree/${{ needs.prepare.outputs.xtra_sha }}
+          - Script di build: cartella ci/ di questo repository
+
+          Piattaforme incluse: vedi manifest.json.
+          EOF
+          gh release create "$TAG" dist/* --title "QEMU-3dfx ${QEMU_VERSION} ($TAG)" \
+            --notes-file notes.md --target "${{ github.sha }}"

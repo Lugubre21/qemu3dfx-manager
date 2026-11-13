@@ -1,0 +1,80 @@
+# Costruisce gli installer di QEMU-3dfx Manager per Windows, macOS e Linux.
+#
+# - Ad ogni tag "v*" (es. v0.2.0) crea la release con gli installer.
+# - Da Actions > "Build app" > Run workflow si ottengono gli installer come
+#   artifact, senza pubblicare nulla.
+name: Build app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-15-intel
+            name: macos-x64
+          - os: macos-15
+            name: macos-arm64
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dipendenze
+        run: python -m pip install -r requirements-build.txt
+      - name: Versione
+        id: v
+        shell: bash
+        run: |
+          V=$(python -c "import q3dfx; print(q3dfx.__version__)")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$V" ]]; then
+            echo "::error::Il tag ${GITHUB_REF#refs/tags/} non corrisponde a __version__ = $V"
+            exit 1
+          fi
+      - name: Inno Setup
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+      - name: Librerie per Qt e AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libegl1 libfuse2 file
+      - name: Installer
+        shell: bash
+        run: python packaging/build_local.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.name }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: app-*, path: dist, merge-multiple: true }
+      - name: Pubblica
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          gh release create "${GITHUB_REF_NAME}" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "QEMU-3dfx Manager ${GITHUB_REF_NAME#v}" --generate-notes
