@@ -12,8 +12,10 @@
 set -uo pipefail
 
 SRC=$(cd "$1" && pwd)
-OUT=$2
-mkdir -p "$OUT"
+# Percorso ASSOLUTO: lo script cambia cartella piu' volte e un percorso
+# relativo finirebbe in un posto diverso da quello atteso dal workflow.
+mkdir -p "$2"
+OUT=$(cd "$2" && pwd)
 
 build_dir() {
   local dir=$1
